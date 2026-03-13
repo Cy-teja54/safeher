@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:url_launcher/url_launcher.dart';
+
+import 'native_comm_channel.dart';
+import 'volume_button_service.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -10,11 +12,13 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // ── Replace with your real emergency contact number ──
-  static const String emergencyNumber = '+918779025552';
+  static const String emergencyNumber = '+916302620295';
 
   bool _isLoading = false;
+  bool _isAccessibilityEnabled = false;
+  late final VolumeButtonService _volumeService;
 
   // ────────────────────────────────────────────────────────
   // Lifecycle
@@ -22,16 +26,59 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    _requestLocationPermission();
+    WidgetsBinding.instance.addObserver(this);
+    _requestPermissions();
+    _checkAccessibility();
+
+    // Start listening for volume button triple-press (foreground)
+    _volumeService = VolumeButtonService(
+      onTriplePress: _onSosPressed,
+    );
+    _volumeService.start();
   }
 
-  Future<void> _requestLocationPermission() async {
-    final status = await Permission.location.request();
-    if (status.isDenied || status.isPermanentlyDenied) {
-      if (!mounted) return;
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _volumeService.stop();
+    super.dispose();
+  }
+
+  /// Re-check accessibility when user returns to the app.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkAccessibility();
+    }
+  }
+
+  Future<void> _checkAccessibility() async {
+    final enabled = await NativeCommChannel.isAccessibilityEnabled();
+    if (mounted) {
+      setState(() => _isAccessibilityEnabled = enabled);
+    }
+  }
+
+  Future<void> _requestPermissions() async {
+    final statuses = await [
+      Permission.location,
+      Permission.sms,
+      Permission.phone,
+    ].request();
+
+    if (!mounted) return;
+
+    final denied = statuses.entries
+        .where((e) => e.value.isDenied || e.value.isPermanentlyDenied)
+        .map((e) => e.key.toString())
+        .toList();
+
+    if (denied.isNotEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Location permission is required for this app to work.'),
+          content: Text(
+            'Location, SMS, and Phone permissions are required for this app to work.',
+          ),
         ),
       );
     }
@@ -44,7 +91,6 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _isLoading = true);
 
     try {
-      // Check if location services are enabled
       bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
         if (!mounted) return null;
@@ -54,7 +100,6 @@ class _HomeScreenState extends State<HomeScreen> {
         return null;
       }
 
-      // Check permission again (in case it was revoked)
       LocationPermission permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
@@ -79,7 +124,6 @@ class _HomeScreenState extends State<HomeScreen> {
         return null;
       }
 
-      // Get current position
       final position = await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
           accuracy: LocationAccuracy.high,
@@ -98,23 +142,68 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ────────────────────────────────────────────────────────
-  // Open SMS app with a pre-filled message
+  // Send SMS directly (no SMS app opens)
   // ────────────────────────────────────────────────────────
-  Future<void> _openSms(String message) async {
-    final uri = Uri(
-      scheme: 'sms',
-      path: emergencyNumber,
-      queryParameters: {'body': message},
+  Future<bool> _sendDirectSms(String message) async {
+    final smsPermission = await Permission.sms.status;
+    if (!smsPermission.isGranted) {
+      final result = await Permission.sms.request();
+      if (!result.isGranted) {
+        if (!mounted) return false;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('SMS permission is required to send alerts.')),
+        );
+        return false;
+      }
+    }
+
+    final success = await NativeCommChannel.sendSms(
+      phoneNumber: emergencyNumber,
+      message: message,
     );
 
-    if (await canLaunchUrl(uri)) {
-      await launchUrl(uri);
-    } else {
-      if (!mounted) return;
+    if (!mounted) return success;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(success ? '✅ SMS sent successfully!' : '❌ Failed to send SMS.'),
+        backgroundColor: success ? Colors.green : Colors.red,
+      ),
+    );
+    return success;
+  }
+
+  // ────────────────────────────────────────────────────────
+  // Make a direct call (no dialer opens)
+  // ────────────────────────────────────────────────────────
+  Future<bool> _makeDirectCall() async {
+    final phonePermission = await Permission.phone.status;
+    if (!phonePermission.isGranted) {
+      final result = await Permission.phone.request();
+      if (!result.isGranted) {
+        if (!mounted) return false;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Phone permission is required to make calls.')),
+        );
+        return false;
+      }
+    }
+
+    final success = await NativeCommChannel.makeDirectCall(
+      phoneNumber: emergencyNumber,
+    );
+
+    if (!mounted) return success;
+
+    if (!success) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not open SMS app.')),
+        const SnackBar(
+          content: Text('❌ Failed to place call.'),
+          backgroundColor: Colors.red,
+        ),
       );
     }
+    return success;
   }
 
   // ────────────────────────────────────────────────────────
@@ -126,7 +215,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
     final message =
         'I need help! My location: https://maps.google.com/?q=${position.latitude},${position.longitude}';
-    await _openSms(message);
+
+    // Send SMS first, then make the call
+    await _sendDirectSms(message);
+    await _makeDirectCall();
   }
 
   Future<void> _onSendLocationPressed() async {
@@ -135,20 +227,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
     final message =
         'My location: https://maps.google.com/?q=${position.latitude},${position.longitude}';
-    await _openSms(message);
+    await _sendDirectSms(message);
   }
 
   Future<void> _onCallPressed() async {
-    final uri = Uri(scheme: 'tel', path: emergencyNumber);
-
-    if (await canLaunchUrl(uri)) {
-      await launchUrl(uri);
-    } else {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not open dialer.')),
-      );
-    }
+    await _makeDirectCall();
   }
 
   // ────────────────────────────────────────────────────────
@@ -237,6 +320,74 @@ class _HomeScreenState extends State<HomeScreen> {
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(16),
                         ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 32),
+
+                  // ── Background SOS status ──
+                  GestureDetector(
+                    onTap: _isAccessibilityEnabled
+                        ? null
+                        : () => NativeCommChannel.openAccessibilitySettings(),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 12,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _isAccessibilityEnabled
+                            ? Colors.green.shade50
+                            : Colors.orange.shade50,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: _isAccessibilityEnabled
+                              ? Colors.green.shade300
+                              : Colors.orange.shade300,
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                _isAccessibilityEnabled
+                                    ? Icons.check_circle
+                                    : Icons.volume_down,
+                                color: _isAccessibilityEnabled
+                                    ? Colors.green.shade700
+                                    : Colors.orange.shade700,
+                                size: 20,
+                              ),
+                              const SizedBox(width: 8),
+                              Flexible(
+                                child: Text(
+                                  _isAccessibilityEnabled
+                                      ? 'Background SOS active — Vol down 3×'
+                                      : 'Tap to enable background SOS',
+                                  style: TextStyle(
+                                    color: _isAccessibilityEnabled
+                                        ? Colors.green.shade800
+                                        : Colors.orange.shade800,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          if (!_isAccessibilityEnabled) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              'Enable SafeHer in Accessibility Settings',
+                              style: TextStyle(
+                                color: Colors.orange.shade600,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                     ),
                   ),

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_description">SafeHer uses this service to detect volume button presses for emergency SOS, even when the app is in the background. Press volume down 3 times quickly to send an emergency SMS and call.</string>
+</resources>
